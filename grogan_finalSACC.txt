@@ -1,0 +1,282 @@
+import re 
+from bs4 import BeautifulSoup 
+import requests 
+import pdfminer.high_level
+import io
+import json
+from pdfminer3.layout import LAParams
+
+#Website with links to all the Minutes
+
+councilsite ="https://www.sanantonio.gov/Clerk/Legislative/City-Council-Agendas-Minutes#132762778-meeting-minutes"
+
+r = requests.get(councilsite)
+
+#In the page source, every link to a meeting's minutes has a unique marker "_blank"
+
+soup = BeautifulSoup(r.content,"lxml") 
+councilmeetings = soup.find_all(target="_blank")
+
+
+urllist=list()
+meetingdate=list()
+exceptions=list()
+
+#Function for extracting info from pdf text later
+
+def roll(body):
+    
+    #The majority of the meetings have a formula where the roll call is taken and lists the
+    #attendees, for example Present: Mayor Nirember, Trevino, etc. But unfortunately not all, so there is noise
+    #in the pattern recognition that needs to be cleaned. Sometimse there is no roll call taken at all, so there
+    #must be an exception block. Also, sometimes the reading package straight up doesn't read the PDF, so this needs
+    #to test for those cases as well. Result should be a list object of councilmember names
+    
+    try:
+        present=re.findall('(?:PRESENT: |Present: ).*?and .*?(?:Absent|.|\s)',body,flags=re.I)[0]
+        
+        
+        present=re.sub(r' and ',', and ',present)
+        present=re.sub(r',,',',',present)
+        
+        votefinish=re.sub(r'(present:|mayor| and |\d| |-|\.)','',present,flags=re.I)
+        votefinish='('+re.sub(r',','|',votefinish)+")"
+        present=re.sub(r'(present:|mayor| and |\d| , | |-|\.)','',present,flags=re.I).split(',')
+        removal=list()  
+        for i in present:
+            if len(i)>20:
+                removal.append(i)
+        for i in removal:
+            present.remove(i)
+        presentcount=len(present)
+    except:
+        present=['NA']
+        presentcount=['NA']
+    
+    #Similarly to the formula for taking roll, votes are typically recorded as lists of AYEs, NAYS, or ABSENT.
+    #The challenge is trying to account both for the when the reading package accidentally separates or misreads words
+    #or when the record of the meeting deviates from the pattern of the majority of meetings
+    #To try to makes sure only member votes are recorded, the list of Aye votes is compared to the previously taken list 
+    #of members in attendence
+    #Finally, statistics are calculated to compare the the Ayes to the total attendees
+    #Oftentimes meetings will have no vote at all, so those exceptions are handled
+    
+    try:
+
+        vote=re.findall(r'(?:ye:|yes:)..*?(?:absent|\S\S\S\S\S\.|nay|abstai|recus)',body,flags=re.I)
+        
+        originalvote=vote
+        vote=[re.sub(r' and',', and',i) for i in vote]
+        vote=[re.sub(r',,',',',i) for i in vote]
+        vote=[re.sub(r'(mayor|absent|\.|nay|recus|abstai|io |and |\d| |-|\[|ye:)','',i,flags=re.I) for i in vote]
+        vote=[list(set(re.findall(votefinish,i,flags=re.I))) for i in vote]
+        for i in vote:
+            for j in i:
+                if j in present:
+                    continue
+                else:
+                    i.remove(j)
+        for i in vote:
+            if len(i)<2:
+                vote.remove(i)
+        votecount=len(vote)
+        ayes=list()
+        ayescount=list()
+        ratio=list()
+        if votecount>0:
+            for i in vote:
+                ayes.append(len(i))
+                ratio.append(round(len(i)/presentcount,2))
+        
+            ayeaverage=round(sum(ayes)/len(ayes),2)
+            ratioaverage=round(sum(ratio)/len(ratio),2)
+        else:
+            ayes=['NA']
+            ratio=['NA']
+    except:
+        vote=['NA']
+        votecount=['NA']
+        ayes=['NA']
+        ratio=['NA']
+    
+    return {'present':present,'presentcount':presentcount,'votecount':votecount,'averageayes':ayeaverage,'averageratio':ratioaverage}
+
+
+
+#Scraping the city website to find the filenames for all the city council minutes
+#PDFs on the website can be accessed directly from the url for older years, but more recent years use a javascript PDF 
+#viewer, but those PDFs are all stored in an accessible root directory in folders that are the same as their filename
+#so after the filenames are scraped from the page with all of the meeting links, the PDFs can be found in their home folders
+#This for loop creates the list of urls where the PDFs can actually be found, whatever year they may be from, instead of the
+#page with the PDF viewer
+
+for i in councilmeetings: 
+    try:
+        #this is the naming convention for files before 2016
+        urllist.append(str(re.findall(r'\/Portal.+\.(?i:htm|pdf)',str(i))[0]))
+        meetingdate.append(str(re.findall(r'\d{2}/\d{2}/\d{4}',str(i))[0]))
+               
+    except:
+        try:
+            #This is the one random pdf on the whole website with this naming convention
+            str(re.findall(r'2000.*(.htm|.pdf)',str(i))[0])
+            exceptions.append(str(i)) 
+        except:
+
+            try:
+                #This is the naming convention for files in the last five years
+                meetingdate.append(str(re.findall(r'(\d{2}/\d{2}/\d{4}|\d{2}/\d{1}/\d{4}|\d{1}/\d{2}/\d{4}|\d{1}/\d{1}/\d{4})',str(i))[0]))
+                urllist.append(str(re.findall(r'http.*Docs=',str(i))[0]))
+                
+           
+            except:
+                #There are a handful of exceptions with no markers in sourcecode to determine the location on the site 
+                
+                exceptions.append(str(i))   
+
+#Generating urls and dates that correspond to each meeting
+filedic = dict()
+
+
+for i in range(len(meetingdate)):
+    if urllist[i][:2]=="/P":
+        dlurl="https://www.sanantonio.gov"+urllist[i]
+        subdic=dict()
+        
+        subdic['mdate']=meetingdate[i]
+        subdic['address']=dlurl
+        filedic[i]=subdic
+        
+    else:
+        try:
+            x=str(re.findall(r'\{.+\}',urllist[i])[0])
+            x=re.sub('{','%7B',x)
+            x=re.sub('}','%7D',x)
+            dlurl="https://webapp9.sanantonio.gov/FileNetArchive/"+x+"/"+x+".pdf"
+            subdic=dict()
+            
+            subdic['mdate']=meetingdate[i]
+            subdic['address']=dlurl
+            filedic[i]=subdic
+            
+        except:
+            try:
+                x=str(re.findall(r'%7b.+%7d',urllist[i])[0])
+                dlurl="https://webapp9.sanantonio.gov/FileNetArchive/"+x+"/"+x+".pdf"
+                subdic=dict()
+                
+                subdic['mdate']=meetingdate[i]
+                subdic['address']=dlurl
+                filedic[i]=subdic
+            except:
+                print(urllist[i])
+                break
+
+#Test the urls match up with the dates of the meetings                
+assert(len(urllist)==len(meetingdate)==len(filedic))
+
+fileexceptions=list()
+
+#This loop takes the dictionary that already contains the date and PDF url for each city council meeting, and adds
+#information from the text of that PDF, first by converting the PDF to text using PDFMiner and then running the function
+#to count the votes and attendees. Also attempted is to create a frequency of councilmember attendence over the years
+#to track how long they stick around, but there still needs to be developed a workaround for the imprecise reading of
+#the councilmember names which currently produces inaccurate names
+#To update this dictionary takes approximately two hours
+
+
+attendence=dict()
+
+
+for i in filedic:
+
+    if i%30==0:
+        print(i)
+    
+    try:
+        openpdf=requests.get(filedic[i]['address'])
+        bites = io.BytesIO(openpdf.content)
+        textversion=pdfminer.high_level.extract_text(bites,laparams=LAParams(line_overlap=0.7,boxes_flow=-0.8,line_margin=0.4,char_margin = 9)) 
+        textversion=re.sub(r'(\x0c|\n|Page \d+)','',textversion)
+        if len(textversion)==0:
+            
+            fileexceptions.append(i)
+            
+        else:
+            filedic[i]['length']=len(textversion)
+            filedic[i]['wordcount']=len(textversion.split())
+            #filedic[i]['uniquewordcount']=len(set(textversion.split()))
+            filedic[i]['year']=filedic[i]['mdate'][-4:]
+            #filedic[i]['body']=textversion
+            filedic[i].update(roll(textversion))
+            
+        
+
+            for x in filedic[i]['present']:
+                k=x.lower()
+                if len(k)<20 and len(k)>4:
+
+                    if attendence.get(filedic[i]['year'],False):
+                        if attendence[filedic[i]['year']].get(k,False):
+                            attendence[filedic[i]['year']][k]+=1
+                        else:
+                            attendence[filedic[i]['year']][k]=1
+                    else:
+                        attendence[filedic[i]['year']]=dict()
+                        attendence[filedic[i]['year']][k]=1
+            
+       
+            
+    except:
+        
+        fileexceptions.append(i)
+
+
+
+process=filedic
+
+output=list()
+
+outputattend=list()
+
+#For the file output that will be used for visualization, the url and list of attendees is removed
+#as well as those meetings that produced no resulting statistics either because the PDF could not be read
+#or there were no votes or rollcall taken
+
+for i in fileexceptions:
+    del process[i]
+
+for i in process:
+    del process[i]['address']
+    del process[i]['present']
+
+
+for i in process:
+    output.append(process[i])
+
+
+
+for i in attendence:
+    attend2=dict()
+    attend2['year']=i
+    attend2.update(attendence[i])
+    outputattend.append(attend2)
+
+#Output to chosen filenames
+
+filename="visualizeoutput.json"
+update=open(filename,'w')
+json.dump(output,update)
+update.close()
+
+filename="unedited.json"
+update=open(filename,'w')
+json.dump(filedic,update)
+update.close()
+
+filename="attendence.json"
+update=open(filename,'w')
+json.dump(outputattend,update)
+update.close()
+
+print("done")
